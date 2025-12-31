@@ -1,0 +1,209 @@
+import pandas as pd
+import polars as pl
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score, root_mean_squared_error
+from sklearn.model_selection import KFold, cross_val_score, GridSearchCV, RandomizedSearchCV, train_test_split
+from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures
+from sklearn.tree import DecisionTreeRegressor, plot_tree
+import xgboost as xgb
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+
+data_oj = pl.read_csv('/Users/terryd70/Desktop/Econ487/oj.csv')
+
+data_oj = (data_oj
+           .with_columns(pl.col('price').log().alias('log_price'))
+           )
+
+# Create lag variables by first pivoting the data
+oj_wide = (data_oj
+    .select(['store', 'week', 'brand', 'logmove', 'log_price', 'feat'])
+    .unpivot(index=['store', 'week', 'brand'], 
+          on=['logmove', 'log_price', 'feat'])
+    .with_columns(
+        pl.concat_str([pl.col('variable'), pl.col('brand')], separator='_').alias('variable')
+    )
+    .pivot(index=['store', 'week'], 
+           on='variable', 
+           values='value')
+)
+
+oj_model = (data_oj
+    # Lag 1 of log quantity, log price, feature; feel free to lag more
+    .join(
+        oj_wide
+        .with_columns((pl.col('week') + 1).alias('week'))
+        .rename({col: f'{col}_lag_1' for col in oj_wide.columns 
+                 if col.startswith(('logmove_', 'log_price_', 'feat_'))}),
+        on=['store', 'week'],
+        how='left'
+    )
+    # Final transformations
+    .with_columns([
+        pl.col('brand').cast(pl.Categorical),
+        (pl.col('week') - pl.col('week').min()).alias('week'),
+        pl.arange(0, pl.len()).alias('id')
+    ])
+    .drop(['SSTRVOL', 'CPWVOL5'])
+    .drop_nulls()
+)
+
+#Turn categorical variables into "dummy" variables
+oj_model = oj_model.to_dummies(columns=['brand'])
+
+#Ensure predictions are made by models that aren't trained on the data they're making predictions for 
+
+# Create a polynomial of degree 2 as well as interaction terms between every pair of features
+poly = PolynomialFeatures(degree=2, include_bias=False)
+
+first_half = oj_model.sample(fraction=0.5, 
+                             seed=487)
+
+# Anti-join to get the remaining rows
+second_half = oj_model.join(
+    first_half.select('id'),
+    on='id',
+    how='anti'
+)
+
+# Create feature and outcome sets for the first half data
+X_q_first = first_half.drop(['logmove', 'log_price', 'price', 'feat', 'id', 'store'])
+y_q_first = first_half['logmove']
+
+X_p_first = first_half.drop(['logmove', 'log_price', 'price', 'feat', 'id', 'store'])
+y_p_frst = first_half['log_price']
+
+X_q_first_poly = poly.fit_transform(X_q_first)
+X_p_first_poly = poly.fit_transform(X_p_first)
+
+# Create feature and outcome sets for the second half data
+X_q_second = second_half.drop(['logmove', 'log_price', 'price', 'feat', 'id', 'store'])
+y_q_second = second_half['logmove']
+
+X_p_second = second_half.drop(['logmove', 'log_price', 'price', 'feat', 'id', 'store'])
+y_p_second = second_half['log_price']
+
+X_q_second_poly = poly.fit_transform(X_q_second)
+X_p_second_poly = poly.fit_transform(X_p_second)
+
+#Predictions on 1/2 of data by model trained on the other half
+
+rf_q_first_gen = RandomForestRegressor(
+    n_estimators=50,
+    random_state=487
+)
+rf_q_first_gen.fit(X_q_first_poly, y_q_first)
+
+rf_p_first_gen = RandomForestRegressor(
+    n_estimators=50,
+    random_state=487
+)
+rf_p_first_gen.fit(X_p_first_poly, y_p_frst)
+
+rf_q_second_gen = RandomForestRegressor(
+    n_estimators=50,
+    random_state=487
+)
+rf_q_second_gen.fit(X_q_second_poly, y_q_second)
+
+rf_p_second_gen = RandomForestRegressor(
+    n_estimators=50,
+    random_state=487
+)
+rf_p_second_gen.fit(X_p_second_poly, y_p_second)
+
+q_hat_first_gen = rf_q_first_gen.predict(X_q_first_poly)
+p_hat_first_gen = rf_p_first_gen.predict(X_p_first_poly)
+
+first_half = first_half.with_columns(
+    q_hat = pl.Series(q_hat_first_gen),
+    p_hat = pl.Series(p_hat_first_gen)
+).with_columns(
+    q_resid = pl.col('logmove') - pl.col('q_hat'),
+    p_resid = pl.col('log_price') - pl.col('p_hat')
+)
+
+#q_hat and p_hat values
+#Merge two halves back together
+
+q_hat_second_gen = rf_q_first_gen.predict(X_q_second_poly)
+p_hat_second_gen = rf_p_first_gen.predict(X_p_second_poly)
+
+second_half = second_half.with_columns(
+    q_hat = pl.Series(q_hat_second_gen),
+    p_hat = pl.Series(p_hat_second_gen)
+).with_columns(
+    q_resid = pl.col('logmove') - pl.col('q_hat'),
+    p_resid = pl.col('log_price') - pl.col('p_hat')
+)
+
+oj_half_gen_dml = pl.concat([first_half, second_half])
+
+oj_half_gen_dml = oj_half_gen_dml.with_columns(
+    brand=pl.when(pl.col('brand_tropicana') == 1).then(pl.lit('tropicana'))
+        .when(pl.col('brand_minute.maid') == 1).then(pl.lit('minute.maid'))
+        .otherwise(pl.lit('dominicks'))
+)
+
+#Own-price OLS regression to determine causality
+
+own_price_dml_half_gen = smf.ols('q_resid ~ p_resid*C(brand)', data = oj_half_gen_dml.to_pandas()).fit()
+
+print(own_price_dml_half_gen.summary())
+
+#Reshape data for cross-price elasticity
+
+oj_with_residuals_wide = oj_half_gen_dml.pivot(
+    index=['store', 'week'],
+    on='brand',
+    values=['q_resid', 'p_resid']
+)
+
+#Cross-price elasticty matrix
+
+data_oj_final = data_oj.with_columns(
+        pl.when(pl.col("brand") == "minute.maid")
+        .then(pl.lit("minute_maid"))
+        .otherwise(pl.col("brand"))
+        .alias("brand")) 
+
+brands = data_oj_final['brand'].unique().to_list()
+
+oj_with_residuals_wide = oj_with_residuals_wide.rename({
+    'q_resid_minute.maid': 'q_resid_minute_maid',
+    'p_resid_minute.maid': 'p_resid_minute_maid'
+})
+
+def cross_logprice_elasticity_matrix(df):
+    results = []
+    
+    # Convert to pandas once for all regressions
+    df_pd = df.to_pandas()
+    
+    for brand in brands:
+        # Build formula: q_resid_brand ~ p_resid_brand1 + p_resid_brand2 + ...
+        dependent_var = f'q_resid_{brand}'
+        independent_vars = ' + '.join([f'p_resid_{b}' for b in brands])
+        formula = f'{dependent_var} ~ {independent_vars}'
+        
+        # Fit elasticity model
+        model = smf.ols(formula, data=df_pd).fit()
+        
+        # Extract coefficients for p_resid terms (excluding intercept)
+        coef_dict = {'q': brand}
+        for param_name, param_value in model.params.items():
+            if 'p_resid' in param_name:
+                coef_dict[param_name] = param_value
+        
+        results.append(pl.DataFrame([coef_dict]))
+    
+    # Combine all results
+    elasticity_matrix = pl.concat(results)
+    
+    return elasticity_matrix
+
+# Run the function
+elasticity_matrix = cross_logprice_elasticity_matrix(oj_with_residuals_wide)
