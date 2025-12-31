@@ -1,0 +1,280 @@
+import pandas as pd
+import polars as pl
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score, root_mean_squared_error
+from sklearn.model_selection import KFold, cross_val_score, GridSearchCV, RandomizedSearchCV, train_test_split
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.tree import DecisionTreeRegressor, plot_tree
+import xgboost as xgb
+from xgboost import XGBRegressor
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge, RidgeCV, Lasso
+import cvxopt
+import patsy
+
+
+
+df = pd.read_csv('oj.csv')
+
+
+df['logprice'] = np.log(df['price'])
+
+
+### LAGGED FEATURES
+
+# Sort
+df = df.sort_values(['store', 'brand', 'week']).reset_index(drop=True)
+
+df_wide = df.pivot_table(
+    index=['store', 'week'],
+    columns='brand',
+    values=['price', 'logmove', 'logprice'],
+    aggfunc='first'
+).reset_index()
+
+df_wide.columns = ['_'.join(col).strip('_') if col[1] else col[0] for col in df_wide.columns.values]
+
+demo_vars = ['AGE60', 'EDUC', 'ETHNIC', 'INCOME', 'HHLARGE', 'WORKWOM',
+             'HVAL150', 'SSTRDIST', 'SSTRVOL', 'CPDIST5', 'CPWVOL5', 'feat']
+demo_df = df[['store', 'week'] + demo_vars].drop_duplicates()
+df_wide = df_wide.merge(demo_df, on=['store', 'week'], how='left')
+
+# Lagged variables
+
+df_wide = df_wide.sort_values(['store', 'week']).reset_index(drop=True)
+
+# 1, 2, and 3 weeks lag - get actual brand names from the data
+brands = df['brand'].unique().tolist()
+lag_periods = [1, 2, 3]
+
+print(f"\nBrands to use for lagging: {brands}")
+
+for brand in brands:
+    for lag in lag_periods:
+        # Lag prices
+        df_wide[f'price_{brand}_lag{lag}'] = df_wide.groupby('store')[f'price_{brand}'].shift(lag)
+        df_wide[f'logprice_{brand}_lag{lag}'] = df_wide.groupby('store')[f'logprice_{brand}'].shift(lag)
+
+        # Lag quantities
+        df_wide[f'logmove_{brand}_lag{lag}'] = df_wide.groupby('store')[f'logmove_{brand}'].shift(lag)
+
+
+### INTERACTION TERMS
+
+interaction_demos = ['INCOME', 'AGE60', 'EDUC', 'ETHNIC']
+
+for brand in brands:
+    for demo in interaction_demos:
+        # Interactions with lagged price
+        df_wide[f'logprice_{brand}_lag1_x_{demo}'] = df_wide[f'logprice_{brand}_lag1'] * df_wide[demo]
+
+        # Interactions with lagged quantity
+        df_wide[f'logmove_{brand}_lag1_x_{demo}'] = df_wide[f'logmove_{brand}_lag1'] * df_wide[demo]
+
+
+### BRAND-SPECIFIC REGRESSIONS
+
+
+# Separate dataframes for each brand
+dfs_by_brand = {}
+for brand in brands:
+    brand_cols = ['store', 'week'] + [col for col in df_wide.columns if brand in col or col in demo_vars]
+    # Cross-price elasticity
+    for other_brand in brands:
+        if other_brand != brand:
+            price_cols = [col for col in df_wide.columns if f'price_{other_brand}' in col or f'logprice_{other_brand}' in col]
+            brand_cols.extend(price_cols)
+
+    brand_cols = list(set(brand_cols))  # Remove duplicates
+    dfs_by_brand[brand] = df_wide[brand_cols].copy()
+
+    dfs_by_brand[brand] = dfs_by_brand[brand].rename(columns={
+        f'logmove_{brand}': 'logmove',
+        f'price_{brand}': 'price',
+        f'logprice_{brand}': 'logprice'
+    })
+
+    dfs_by_brand[brand] = dfs_by_brand[brand].dropna()
+
+
+### OWN-PRICE ELASTICITY
+
+def double_ml_own_price(df, brand_name):
+
+    Y = df['logmove'].values
+    D = df['logprice'].values  # Treatment: log price
+
+    # Confounders
+    exclude_cols = ['logmove', 'logprice', 'price', 'store', 'week']
+    X_cols = [col for col in df.columns if col not in exclude_cols]
+
+    # Dummies
+    store_dummies = pd.get_dummies(df['store'], prefix='store', drop_first=True)
+    week_dummies = pd.get_dummies(df['week'], prefix='week', drop_first=True)
+
+    X = pd.concat([df[X_cols], store_dummies, week_dummies], axis=1)
+    X = X.fillna(0)  
+
+    # ML model for Y ~ X (outcome model)
+    # XGBoost
+    model_Y = XGBRegressor(
+        n_estimators=100,
+        max_depth=6,
+        learning_rate=0.1,
+        random_state=42,
+        n_jobs=-1
+    )
+    model_Y.fit(X, Y)
+    Y_pred = model_Y.predict(X)
+    Y_res = Y - Y_pred
+
+    # ML model for D ~ X (treatment model)
+    model_D = XGBRegressor(
+        n_estimators=100,
+        max_depth=6,
+        learning_rate=0.1,
+        random_state=42,
+        n_jobs=-1
+    )
+    model_D.fit(X, D)
+    D_pred = model_D.predict(X)
+    D_res = D - D_pred
+
+    # OLS regression of residuals
+    # Add constant
+    D_res_with_const = sm.add_constant(D_res)
+    final_model = sm.OLS(Y_res, D_res_with_const).fit()
+
+    # The coefficient on D_res is the own-price elasticity
+    elasticity = final_model.params[1]
+    std_error = final_model.bse[1]
+    t_stat = final_model.tvalues[1]
+    p_value = final_model.pvalues[1]
+
+    print(f"\n{'='*70}")
+    print(f"PART A: OWN-PRICE ELASTICITY - {brand_name.upper()}")
+    print(f"{'='*70}")
+    print(f"Own-Price Elasticity: {elasticity:.4f}")
+    print(f"Standard Error: {std_error:.4f}")
+    print(f"t-statistic: {t_stat:.4f}")
+    print(f"p-value: {p_value:.4f}")
+    print(f"95% CI: [{elasticity - 1.96*std_error:.4f}, {elasticity + 1.96*std_error:.4f}]")
+    print(f"\nInterpretation: A 1% increase in {brand_name} price leads to a")
+    print(f"{elasticity:.4f}% change in {brand_name} sales (log-log specification)")
+
+    return {
+        'brand': brand_name,
+        'elasticity': elasticity,
+        'std_error': std_error,
+        't_stat': t_stat,
+        'p_value': p_value,
+        'model': final_model,
+        'Y_res': Y_res,
+        'D_res': D_res
+    }
+
+# own-price elasticity for each brand
+print("\n" + "="*70)
+print("DOUBLE ML ESTIMATION - PART A: OWN-PRICE ELASTICITIES")
+print("="*70)
+
+results_part_a = {}
+for brand in brands:
+    results_part_a[brand] = double_ml_own_price(dfs_by_brand[brand], brand)
+
+
+### 3x3 ELASTICITY MATRIX USING DOUBLE ML
+
+def double_ml_full_matrix(df_dict, brands):
+
+    elasticity_matrix = np.zeros((3, 3))
+    se_matrix = np.zeros((3, 3))
+
+    for i, brand_y in enumerate(brands):
+        print(f"\n{'='*70}")
+        print(f"ESTIMATING ELASTICITIES FOR {brand_y.upper()} SALES")
+        print(f"{'='*70}")
+
+        df = df_dict[brand_y].copy()
+
+        # Outcome
+        Y = df['logmove'].values
+
+        # Treatments: log prices of all three brands
+        treatment_cols = []
+        for brand_d in brands:
+            if brand_d == brand_y:
+                treatment_cols.append('logprice')
+            else:
+                # Find the column for other brand's price
+                price_col = [col for col in df.columns if f'logprice_{brand_d}' in col and 'lag' not in col]
+                if price_col:
+                    treatment_cols.append(price_col[0])
+
+        D_matrix = df[treatment_cols].values
+
+        # Confounders
+        exclude_cols = ['logmove', 'price', 'store', 'week'] + treatment_cols
+        X_cols = [col for col in df.columns if col not in exclude_cols]
+
+        # Add store and week fixed effects
+        store_dummies = pd.get_dummies(df['store'], prefix='store', drop_first=True)
+        week_dummies = pd.get_dummies(df['week'], prefix='week', drop_first=True)
+
+        X = pd.concat([df[X_cols], store_dummies, week_dummies], axis=1)
+        X = X.fillna(0)
+
+        # Predict Y using X (outcome model)
+        model_Y = XGBRegressor(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42,
+            n_jobs=-1
+        )
+        model_Y.fit(X, Y)
+        Y_pred = model_Y.predict(X)
+        Y_res = Y - Y_pred
+
+        # Predict each treatment (price) using X
+        D_res_matrix = np.zeros_like(D_matrix)
+        for j in range(D_matrix.shape[1]):
+            model_D = XGBRegressor(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42,
+                n_jobs=-1
+            )
+            model_D.fit(X, D_matrix[:, j])
+            D_pred = model_D.predict(X)
+            D_res_matrix[:, j] = D_matrix[:, j] - D_pred
+
+        # OLS regression Y_res on all D_res
+        D_res_with_const = sm.add_constant(D_res_matrix)
+        final_model = sm.OLS(Y_res, D_res_with_const).fit()
+
+        elasticities = final_model.params[1:]  # Skip constant
+        std_errors = final_model.bse[1:]
+
+        print(f"\nResults for {brand_y.upper()} sales:")
+        print(f"{'-'*70}")
+        for j, brand_d in enumerate(brands):
+            elasticity_matrix[i, j] = elasticities[j]
+            se_matrix[i, j] = std_errors[j]
+
+            elasticity_type = "Own-price" if brand_d == brand_y else "Cross-price"
+            print(f"{elasticity_type} elasticity w.r.t. {brand_d}: {elasticities[j]:.4f} (SE: {std_errors[j]:.4f})")
+
+    return elasticity_matrix, se_matrix
+
+print("\n" + "="*70)
+print("DOUBLE ML ESTIMATION - PART B: FULL 3x3 ELASTICITY MATRIX")
+print("="*70)
+
+elasticity_matrix, se_matrix = double_ml_full_matrix(dfs_by_brand, brands)
