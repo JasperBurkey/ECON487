@@ -1,0 +1,414 @@
+import pandas as pd
+import polars as pl
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score, root_mean_squared_error
+from sklearn.model_selection import KFold, cross_val_score, GridSearchCV, RandomizedSearchCV, train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures
+from sklearn.tree import DecisionTreeRegressor, plot_tree
+import xgboost as xgb
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+
+
+data_oj = pl.read_csv('/Users/terryd70/Desktop/Econ487/oj.csv')
+
+data_oj = (data_oj
+           .with_columns(pl.col('price').log().alias('log_price'))
+           )
+
+oj_tree = (
+    data_oj
+    .with_columns(q = pl.col("logmove").exp())
+    .with_columns(
+        weighted_price = (
+            (pl.col("price") * pl.col("q")).sum() / pl.col("q").sum()
+        ).over(["store", "week"])
+    )
+)
+
+reg_tree_data = oj_tree.select(pl.exclude('row_id', 'logmove','store', 'brand', 'week', 'lag_week', 'log_price', 'feat', 'price', 'q', 'lag_log_price', 'lag_price'))
+
+y = reg_tree_data.select('weighted_price').to_numpy().ravel()
+X = reg_tree_data.select(pl.exclude('weighted_price')).to_numpy()
+
+tree = DecisionTreeRegressor(ccp_alpha=0.002, random_state=487)
+tree.fit(X, y)
+
+oj_w_leaves = oj_tree.with_columns([
+    pl.Series('leaf', tree.apply(X)),
+    pl.col('price').log().alias('log_price')
+])
+
+y_hat = tree.predict(X)
+
+mse = mean_squared_error(y_hat, y)
+print(f"Mean Squared Error: {mse:.4f}")
+
+plt.figure(figsize=(20, 10))
+plot_tree(
+    tree,
+    feature_names=reg_tree_data.select(pl.exclude('weighted_price')).columns,
+    filled=True,
+    rounded=True,
+    fontsize=10
+)
+plt.title("Decision Tree Structure")
+plt.show()
+
+leaves = oj_w_leaves['leaf'].unique().to_list()
+
+oj_wide = (oj_w_leaves
+    .select(['store', 'week', 'brand', 'logmove', 'log_price', 'feat'])
+    .unpivot(index=['store', 'week', 'brand'], 
+          on=['logmove', 'log_price', 'feat'])
+    .with_columns(
+        pl.concat_str([pl.col('variable'), pl.col('brand')], separator='_').alias('variable')
+    )
+    .pivot(index=['store', 'week'], 
+           on='variable', 
+           values='value')
+)
+
+oj_model = (oj_w_leaves
+    # Lag 1
+    .join(
+        oj_wide
+        .with_columns((pl.col('week') + 1).alias('week'))
+        .rename({col: f'{col}_lag_1' for col in oj_wide.columns 
+                 if col.startswith(('logmove_', 'log_price_', 'feat_'))}),
+        on=['store', 'week'],
+        how='left'
+    )
+    .join(
+        oj_wide
+        .with_columns((pl.col('week') + 2).alias('week'))
+        .rename({col: f'{col}_lag_2' for col in oj_wide.columns 
+                 if col.startswith(('logmove_', 'log_price_', 'feat_'))}),
+        on=['store', 'week'],
+        how='left'
+    )
+    .join(
+        oj_wide
+        .with_columns((pl.col('week') + 3).alias('week'))
+        .rename({col: f'{col}_lag_3' for col in oj_wide.columns 
+                 if col.startswith(('logmove_', 'log_price_', 'feat_'))}),
+        on=['store', 'week'],
+        how='left'
+    )
+    # Final transformations
+    .with_columns([
+        pl.col('brand').cast(pl.Categorical),
+        (pl.col('week') - pl.col('week').min()).alias('week'),
+        pl.arange(0, pl.len()).alias('id')
+    ])
+    .drop(['SSTRVOL', 'CPWVOL5'])
+    .drop_nulls()
+)
+
+oj_model = oj_model.to_dummies(columns=['brand'])
+
+param_grid = {
+    'max_iter': [50, 100, 150],
+    'max_depth': [5, 10, 15]
+}
+
+# Store results for each leaf
+leaf_results = {}
+all_dml_data = []
+
+# Get unique leaf values
+leaves = oj_model['leaf'].unique().to_list()
+
+for leaf_val in leaves:
+    print(f"\n{'='*50}")
+    print(f"Processing Leaf: {leaf_val}")
+    print('='*50)
+    
+    # Filter data for this leaf
+    leaf_data = oj_model.filter(pl.col('leaf') == leaf_val)
+    
+    # Split into two halves
+    first_half = leaf_data.sample(fraction=0.5, seed=487)
+    second_half = leaf_data.join(
+        first_half.select('id'),
+        on='id',
+        how='anti'
+    )
+    
+    # Define columns to drop
+    drop_cols = ['logmove', 'log_price', 'price', 'feat', 'id', 'store', 'leaf', 'q', 'weighted_price', 'week']
+
+    #X_first = first_half.drop(drop_cols).to_pandas()
+    #y_q_first = first_half['logmove'].to_numpy()
+    #y_p_first = first_half['log_price'].to_numpy()
+
+    #X_second = second_half.drop(drop_cols).to_pandas()
+    #y_q_second = second_half['logmove'].to_numpy()
+    #y_p_second = second_half['log_price'].to_numpy()
+    
+    # Create feature and outcome sets for first half
+    X_first = first_half.drop(drop_cols).to_numpy()
+    y_q_first = first_half['logmove'].to_numpy()
+    y_p_first = first_half['log_price'].to_numpy()
+    
+    # Create feature and outcome sets for second half
+    X_second = second_half.drop(drop_cols).to_numpy()
+    y_q_second = second_half['logmove'].to_numpy()
+    y_p_second = second_half['log_price'].to_numpy()
+    
+    # Apply polynomial features
+    poly = PolynomialFeatures(degree=2, include_bias=False)
+    X_first_poly = poly.fit_transform(X_first)
+    X_second_poly = poly.fit_transform(X_second)  # Use transform, not fit_transform
+    
+    
+    # --- First half models with CV ---
+    lgbm_q_first = GridSearchCV(
+        HistGradientBoostingRegressor(random_state=487),
+        param_grid,
+        cv=5,
+        n_jobs=-1
+    )
+    lgbm_q_first.fit(X_first_poly, y_q_first)
+    
+    lgbm_p_first = GridSearchCV(
+        HistGradientBoostingRegressor(random_state=487),
+        param_grid,
+        cv=5,
+        n_jobs=-1
+    )
+    lgbm_p_first.fit(X_first_poly, y_p_first)
+    
+    # --- Second half models with CV ---
+    lgbm_q_second = GridSearchCV(
+        HistGradientBoostingRegressor(random_state=487),
+        param_grid,
+        cv=5,
+        n_jobs=-1
+    )
+    lgbm_q_second.fit(X_second_poly, y_q_second)
+    
+    lgbm_p_second = GridSearchCV(
+        HistGradientBoostingRegressor(random_state=487),
+        param_grid,
+        cv=5,
+        n_jobs=-1
+    )
+    lgbm_p_second.fit(X_second_poly, y_p_second)
+    
+    # Print best parameters
+    print(f"Best params Q (first): {lgbm_q_first.best_params_}")
+    print(f"Best params P (first): {lgbm_p_first.best_params_}")
+    
+    # Cross-fitting: predict each half using the other half's model
+    q_hat_first = lgbm_q_second.predict(X_first_poly)
+    p_hat_first = lgbm_p_second.predict(X_first_poly)
+    
+    first_half = first_half.with_columns(
+        q_hat=pl.Series(q_hat_first),
+        p_hat=pl.Series(p_hat_first)
+    ).with_columns(
+        q_resid=pl.col('logmove') - pl.col('q_hat'),
+        p_resid=pl.col('log_price') - pl.col('p_hat')
+    )
+    
+    q_hat_second = lgbm_q_first.predict(X_second_poly)
+    p_hat_second = lgbm_p_first.predict(X_second_poly)
+    
+    second_half = second_half.with_columns(
+        q_hat=pl.Series(q_hat_second),
+        p_hat=pl.Series(p_hat_second)
+    ).with_columns(
+        q_resid=pl.col('logmove') - pl.col('q_hat'),
+        p_resid=pl.col('log_price') - pl.col('p_hat')
+    )
+    
+    # Combine halves for this leaf
+    leaf_dml = pl.concat([first_half, second_half])
+    
+    # Add brand column
+    leaf_dml = leaf_dml.with_columns(
+        brand=pl.when(pl.col('brand_tropicana') == 1).then(pl.lit('tropicana'))
+            .when(pl.col('brand_minute.maid') == 1).then(pl.lit('minute.maid'))
+            .otherwise(pl.lit('dominicks'))
+    )
+    
+    # Run the final stage regression
+    dml_model = smf.ols('q_resid ~ p_resid*C(brand)', data=leaf_dml.to_pandas()).fit()
+    
+    print(f"\nDML Results for Leaf {leaf_val}:")
+    print(dml_model.summary())
+    
+    # Store results
+    leaf_results[leaf_val] = {
+        'model': dml_model,
+        'best_params': {
+            'q_first': lgbm_p_first.best_params_,
+            'p_first': lgbm_p_first.best_params_
+        }
+    }
+    
+    all_dml_data.append(leaf_dml)
+
+# Combine all leaves
+oj_all_leaves_dml = pl.concat(all_dml_data)
+
+# Summary
+print("\n" + "="*50)
+print("Summary of Price Elasticities by Leaf")
+print("="*50)
+for leaf_val, results in leaf_results.items():
+    model = results['model']
+    print(f"\nLeaf {leaf_val}:")
+    print(f"  Dominicks: {model.params['p_resid']:.3f}")
+    if 'p_resid:C(brand)[T.minute.maid]' in model.params:
+        print(f"  Minute Maid: {model.params['p_resid'] + model.params['p_resid:C(brand)[T.minute.maid]']:.3f}")
+    if 'p_resid:C(brand)[T.tropicana]' in model.params:
+        print(f"  Tropicana: {model.params['p_resid'] + model.params['p_resid:C(brand)[T.tropicana]']:.3f}")
+
+dml_model_all_leaves = smf.ols('q_resid ~ p_resid*C(brand)*C(leaf)', data=oj_all_leaves_dml.to_pandas()).fit()
+print(dml_model_all_leaves.summary())
+
+(oj_all_leaves_dml
+ .group_by(['brand', 'leaf'])
+ .agg(pl.col('log_price').exp().mean().alias('mean_price'))
+ .pivot(on='brand', index='leaf', values='mean_price')
+ .sort('leaf')
+)
+
+data_oj_final = data_oj.with_columns(
+        pl.when(pl.col("brand") == "minute.maid")
+        .then(pl.lit("minute_maid"))
+        .otherwise(pl.col("brand"))
+        .alias("brand")) 
+
+brands = data_oj_final['brand'].unique().to_list()
+
+oj_with_residuals_wide = oj_all_leaves_dml.pivot(
+    index=['store', 'week', 'leaf'],
+    on='brand',
+    values=['q_resid', 'p_resid']
+)
+
+oj_with_residuals_wide = oj_with_residuals_wide.rename({
+    'q_resid_minute.maid': 'q_resid_minute_maid',
+    'p_resid_minute.maid': 'p_resid_minute_maid'
+})
+
+def cross_logprice_elasticity_matrix(df):
+    results = []
+    
+    # Convert to pandas once for all regressions
+    df_pd = df.to_pandas()
+    
+    for brand in brands:
+        # Build formula: q_resid_brand ~ p_resid_brand1 + p_resid_brand2 + ...
+        dependent_var = f'q_resid_{brand}'
+        independent_vars = ' + '.join([f'p_resid_{b}' for b in brands])
+        formula = f'{dependent_var} ~ {independent_vars}'
+        
+        # Fit elasticity model
+        model = smf.ols(formula, data=df_pd).fit()
+        
+        # Extract coefficients for p_resid terms (excluding intercept)
+        coef_dict = {'q': brand}
+        for param_name, param_value in model.params.items():
+            if 'p_resid' in param_name:
+                coef_dict[param_name] = param_value
+        
+        results.append(pl.DataFrame([coef_dict]))
+    
+    # Combine all results
+    elasticity_matrix = pl.concat(results)
+    
+    return elasticity_matrix
+
+# Get unique leaves
+leaves = oj_with_residuals_wide['leaf'].unique().to_list()
+
+# Store results for each leaf
+leaf_elasticity_matrices = {}
+
+for leaf_val in leaves:
+    print(f"\n{'='*50}")
+    print(f"Cross-Price Elasticity Matrix for Leaf: {leaf_val}")
+    print('='*50)
+    
+    # Filter data for this leaf
+    leaf_data = oj_with_residuals_wide.filter(pl.col('leaf') == leaf_val)
+    
+    # Calculate elasticity matrix
+    elasticity_matrix = cross_logprice_elasticity_matrix(leaf_data)
+    
+    print(elasticity_matrix)
+    
+    # Store results
+    leaf_elasticity_matrices[leaf_val] = elasticity_matrix
+
+# If you want all results in one dataframe with leaf identifier
+all_elasticity_matrices = []
+for leaf_val, matrix in leaf_elasticity_matrices.items():
+    matrix_with_leaf = matrix.with_columns(pl.lit(leaf_val).alias('leaf'))
+    all_elasticity_matrices.append(matrix_with_leaf)
+
+combined_elasticity_matrix = pl.concat(all_elasticity_matrices)
+print("\n" + "="*50)
+print("Combined Elasticity Matrix (All Leaves)")
+print("="*50)
+print(combined_elasticity_matrix)
+
+plot_df = oj_all_leaves_dml.to_pandas()
+
+g = sns.FacetGrid(plot_df, hue='brand', height=4, aspect=1.5)
+g.map(plt.scatter, 'p_resid', 'q_resid', alpha=0.5)
+g.add_legend()
+g.set_axis_labels('P Residuals', 'Q Residuals')
+plt.show()
+
+drop_cols = ['logmove', 'log_price', 'price', 'feat', 'id', 'store', 'leaf', 'q', 'weighted_price', 'week']
+
+# Get features and outcomes for the full dataset (or by leaf if needed)
+X = oj_model.drop(drop_cols).to_numpy()
+y_q = oj_model['logmove'].to_numpy()
+y_p = oj_model['log_price'].to_numpy()
+
+# Apply polynomial features
+poly = PolynomialFeatures(degree=2, include_bias=False)
+X_poly = poly.fit_transform(X)
+
+# Fit OLS models
+ols_q = LinearRegression()
+ols_q.fit(X_poly, y_q)
+
+ols_p = LinearRegression()
+ols_p.fit(X_poly, y_p)
+
+# Get OLS predictions and residuals
+q_hat_ols = ols_q.predict(X_poly)
+p_hat_ols = ols_p.predict(X_poly)
+
+oj_ols_residuals = oj_model.with_columns(
+    q_hat_ols=pl.Series(q_hat_ols),
+    p_hat_ols=pl.Series(p_hat_ols)
+).with_columns(
+    q_resid_ols=pl.col('logmove') - pl.col('q_hat_ols'),
+    p_resid_ols=pl.col('log_price') - pl.col('p_hat_ols')
+)
+
+oj_ols_residuals = oj_ols_residuals.with_columns(
+        brand=pl.when(pl.col('brand_tropicana') == 1).then(pl.lit('tropicana'))
+            .when(pl.col('brand_minute.maid') == 1).then(pl.lit('minute.maid'))
+            .otherwise(pl.lit('dominicks'))
+)
+
+plot_ols = oj_ols_residuals.to_pandas()
+
+g = sns.FacetGrid(plot_ols, hue='brand', height=4, aspect=1.5)
+g.map(plt.scatter, 'p_resid_ols', 'q_resid_ols', alpha=0.5)
+g.add_legend()
+g.set_axis_labels('P Residuals', 'Q Residuals')
+plt.show()
